@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import sys
+from datetime import datetime
 from typing import Optional, Dict, Any
 import requests
 
@@ -169,6 +170,23 @@ def format_response(response: Dict[str, Any], pretty: bool = True) -> str:
     return json.dumps(response)
 
 
+def unix_timestamp_to_iso(timestamp_ms: int) -> str:
+    """
+    Convert unix timestamp in milliseconds to ISO 8601 datetime string.
+
+    Args:
+        timestamp_ms: Unix timestamp in milliseconds
+
+    Returns:
+        ISO 8601 formatted datetime string with timezone info
+    """
+    # Convert milliseconds to seconds
+    timestamp_s = timestamp_ms / 1000
+    # Create datetime object and format as ISO string with timezone
+    dt = datetime.fromtimestamp(timestamp_s)
+    return dt.isoformat()
+
+
 def send_message_command(args):
     """Handle the send-message command."""
     try:
@@ -212,14 +230,52 @@ def get_messages_command(args):
     try:
         api_key = load_api_key()
         client = KindroidAPIClient(api_key, args.base_url)
+        chat_id = load_chat_id(args.chat_id)
 
-        response = client.get_chat_messages(
-            chat_id=load_chat_id(args.chat_id),
-            limit=args.limit,
-            offset=args.offset,
-        )
+        # Determine pagination strategy
+        requested_limit = args.limit if args.limit else 50
+        api_limit = min(requested_limit, 100)  # API max is 100
+        needs_pagination = requested_limit > 100
 
-        print(format_response(response, args.pretty))
+        all_messages = []
+        start_after_timestamp = args.offset if args.offset else None
+        messages_fetched = 0
+
+        # Fetch messages with pagination if needed
+        while messages_fetched < requested_limit or not needs_pagination:
+            response = client.get_chat_messages(
+                chat_id=chat_id,
+                limit=api_limit,
+                offset=start_after_timestamp,
+            )
+
+            messages = response.get("messages", [])
+            if not messages:
+                break
+
+            all_messages.extend(messages)
+            messages_fetched += len(messages)
+
+            # Check if we have more pages
+            pagination = response.get("pagination", {})
+            if not pagination.get("hasMore", False) or not needs_pagination:
+                break
+
+            # Set cursor for next page
+            start_after_timestamp = pagination.get("lastTimestamp")
+
+        # Limit results to requested amount
+        all_messages = all_messages[:requested_limit]
+
+        # Output as JSONL with converted timestamps
+        for message in all_messages:
+            # Convert timestamp if present
+            if "timestamp" in message and isinstance(message["timestamp"], (int, float)):
+                message["timestamp"] = unix_timestamp_to_iso(message["timestamp"])
+
+            # Output as JSONL (one JSON object per line)
+            print(json.dumps(message))
+
         return 0
 
     except ValueError as e:
