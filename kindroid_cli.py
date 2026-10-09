@@ -12,10 +12,21 @@ Documentation: https://docs.kindroid.ai/
 import argparse
 import json
 import os
+import shutil
 import sys
-from datetime import datetime
-from typing import Optional, Dict, Any
+from datetime import datetime, timedelta
+from typing import Any, Dict, Optional
+
 import requests
+
+# Windows-specific: support for multi-line input with Shift+Enter
+if sys.platform == "win32":
+    import ctypes
+    import msvcrt
+
+# Session-local input history used by chat prompt navigation.
+_INPUT_HISTORY = []
+_MAX_INPUT_HISTORY = 200
 
 
 class KindroidAPIClient:
@@ -36,14 +47,14 @@ class KindroidAPIClient:
         self.session = requests.Session()
         self.session.headers.update({
             "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
+            "Content-Type" : "application/json",
         })
 
     def send_message(
-        self,
-        chat_id: str,
-        message: str,
-        metadata: Optional[Dict[str, Any]] = None,
+            self,
+            chat_id: str,
+            message: str,
+            metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Send a message to a chat.
@@ -61,7 +72,7 @@ class KindroidAPIClient:
         """
         url = f"{self.base_url}/send-message"
         payload = {
-            "ai_id": chat_id,
+            "ai_id"  : chat_id,
             "message": message,
         }
         if metadata:
@@ -76,10 +87,10 @@ class KindroidAPIClient:
             return {"raw_response": response.text}
 
     def get_chat_messages(
-        self,
-        chat_id: str,
-        limit: Optional[int] = None,
-        offset: Optional[int] = None,
+            self,
+            chat_id: str,
+            limit: Optional[int] = None,
+            offset: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Retrieve messages from a chat.
@@ -154,6 +165,30 @@ def load_chat_id(command_line_chat_id: Optional[str]) -> str:
     return chat_id
 
 
+def load_kindroid_name(command_line_name: Optional[str]) -> str:
+    """
+    Load the kindroid name from command line argument or environment variable.
+
+    Args:
+        command_line_name: The kindroid name passed via command line (if any)
+
+    Returns:
+        The kindroid name
+
+    Raises:
+        ValueError: If kindroid name is not provided
+    """
+    if command_line_name:
+        return command_line_name
+
+    kindroid_name = os.environ.get("KINDROID_NAME")
+    if not kindroid_name:
+        raise ValueError(
+            "Kindroid name not found. Please pass --kindroid or set the KINDROID_NAME environment variable."
+        )
+    return kindroid_name
+
+
 def format_response(response: Dict[str, Any], pretty: bool = True) -> str:
     """
     Format the API response for display.
@@ -170,21 +205,30 @@ def format_response(response: Dict[str, Any], pretty: bool = True) -> str:
     return json.dumps(response)
 
 
-def unix_timestamp_to_iso(timestamp_ms: int) -> str:
+def format_unix_timestamp(timestamp_ms: int, format_str: str = "%Y-%m-%dT%H:%M:%S") -> str:
     """
-    Convert unix timestamp in milliseconds to ISO 8601 datetime string.
+    Convert unix timestamp in milliseconds to a formatted string.
+
+    The timestamp is assumed to be in UTC and is automatically converted to
+    the system's local timezone by datetime.fromtimestamp().
 
     Args:
         timestamp_ms: Unix timestamp in milliseconds
+        format_str: strftime format string. Defaults to ISO 8601 with seconds.
+                   Common formats:
+                   - "%Y-%m-%dT%H:%M:%S" - ISO with seconds (default)
+                   - "%Y-%m-%d %H:%M" - Display format without seconds
+                   - "%Y-%m-%dT%H:%M:%S.%f" - ISO with microseconds
 
     Returns:
-        ISO 8601 formatted datetime string with timezone info
+        Formatted timestamp string in the system's local timezone
     """
     # Convert milliseconds to seconds
     timestamp_s = timestamp_ms / 1000
-    # Create datetime object and format as ISO string with timezone
+    # Create datetime object (automatically converts UTC to system timezone)
     dt = datetime.fromtimestamp(timestamp_s)
-    return dt.isoformat()
+    # Format according to provided format string
+    return dt.strftime(format_str)
 
 
 def send_message_command(args):
@@ -256,7 +300,7 @@ def get_messages_command(args):
         args.offset = offset_override
 
         # Collect all messages from the generator
-        messages = list(get_messages_command_impl(args))
+        messages = list(_get_messages_impl(args))
 
         # Restore original args for consistency
         args.offset = original_offset
@@ -286,7 +330,8 @@ def get_messages_command(args):
         print(f"API Error: {e}", file=sys.stderr)
         return 1
 
-def get_messages_command_impl(args):
+
+def _get_messages_impl(args):
     """Handle the get-messages command."""
     try:
         api_key = load_api_key()
@@ -317,7 +362,7 @@ def get_messages_command_impl(args):
                 if requested_limit and messages_fetched >= requested_limit:
                     break
                 if "timestamp" in m and isinstance(m["timestamp"], (int, float)):
-                    m["datetime"] = unix_timestamp_to_iso(m["timestamp"])
+                    m["datetime"] = format_unix_timestamp(m["timestamp"])
                 yield m
 
             messages_fetched += len(messages)
@@ -330,13 +375,141 @@ def get_messages_command_impl(args):
             # Set cursor for next page
             start_after_timestamp = pagination.get("lastTimestamp")
 
-
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
-        return 1
     except requests.exceptions.RequestException as e:
         print(f"API Error: {e}", file=sys.stderr)
-        return 1
+
+
+def multiline_input(line_prompt: str = "", prompt: str = "") -> str:
+    """
+    Read multi-line input from user.
+
+    On Windows: Shift+Enter creates a newline, Enter submits the message
+    On other systems: Falls back to standard input()
+
+    Args:
+        line_prompt: The prompt to display
+
+    Returns:
+        The complete input (possibly multi-line) as a string
+    """
+    if sys.platform != "win32":
+        # On non-Windows systems, use standard input
+        return input(line_prompt)
+
+    def redraw_current_line(line: str, cursor: int) -> None:
+        # Basic in-place redraw for the active line (single-line editor behavior).
+        terminal_width = max(20, shutil.get_terminal_size((80, 24)).columns)
+        clear_width = max(terminal_width - 1, len(line_prompt) + len(line) + 2)
+        print("\r" + (" " * clear_width) + "\r" + line_prompt + line, end="", flush=True)
+        move_left = len(line) - cursor
+        if move_left > 0:
+            print("\b" * move_left, end="", flush=True)
+
+    def shift_pressed() -> bool:
+        # VK_SHIFT = 0x10
+        return bool(ctypes.windll.user32.GetAsyncKeyState(0x10) & 0x8000)
+
+    lines = []
+    current_chars = []
+    cursor_pos = 0
+    history_index = None
+    draft_line = ""
+    print(prompt)
+    print(line_prompt, end="", flush=True)
+
+    def set_current_line(text: str) -> None:
+        nonlocal current_chars, cursor_pos
+        current_chars = list(text)
+        cursor_pos = len(current_chars)
+        redraw_current_line("".join(current_chars), cursor_pos)
+
+    while True:
+        char = msvcrt.getch()
+
+        if char == b"\x03":
+            raise KeyboardInterrupt()
+
+        if char in (b"\x00", b"\xe0"):
+            ext = msvcrt.getch()
+            # Left / Right / Up / Down / Home / End / Delete
+            if ext == b"K" and cursor_pos > 0:
+                cursor_pos -= 1
+                redraw_current_line("".join(current_chars), cursor_pos)
+            elif ext == b"M" and cursor_pos < len(current_chars):
+                cursor_pos += 1
+                redraw_current_line("".join(current_chars), cursor_pos)
+            elif ext == b"H":  # Up: previous input history (single-line only)
+                if lines:
+                    continue
+                if not _INPUT_HISTORY:
+                    continue
+                if history_index is None:
+                    draft_line = "".join(current_chars)
+                    history_index = len(_INPUT_HISTORY) - 1
+                elif history_index > 0:
+                    history_index -= 1
+                set_current_line(_INPUT_HISTORY[history_index])
+            elif ext == b"P":  # Down: next input history / restore draft
+                if lines:
+                    continue
+                if history_index is None:
+                    continue
+                if history_index < len(_INPUT_HISTORY) - 1:
+                    history_index += 1
+                    set_current_line(_INPUT_HISTORY[history_index])
+                else:
+                    history_index = None
+                    set_current_line(draft_line)
+            elif ext == b"G":
+                cursor_pos = 0
+                redraw_current_line("".join(current_chars), cursor_pos)
+            elif ext == b"O":
+                cursor_pos = len(current_chars)
+                redraw_current_line("".join(current_chars), cursor_pos)
+            elif ext == b"S" and cursor_pos < len(current_chars):
+                del current_chars[cursor_pos]
+                redraw_current_line("".join(current_chars), cursor_pos)
+            continue
+
+        if char == b"\x08":  # Backspace
+            if cursor_pos > 0:
+                del current_chars[cursor_pos - 1]
+                cursor_pos -= 1
+                redraw_current_line("".join(current_chars), cursor_pos)
+            continue
+
+        if char == b"\r":  # Enter
+            current_line = "".join(current_chars)
+            if shift_pressed():
+                # Shift+Enter inserts newline and keeps editing next line.
+                lines.append(current_line)
+                current_chars = []
+                cursor_pos = 0
+                print()
+                print(line_prompt, end="", flush=True)
+                continue
+
+            lines.append(current_line)
+            print()
+            message = "\n".join(lines)
+            # Keep prompt history practical for line recall (single-line messages only).
+            if message and "\n" not in message:
+                _INPUT_HISTORY.append(message)
+                if len(_INPUT_HISTORY) > _MAX_INPUT_HISTORY:
+                    del _INPUT_HISTORY[0]
+            return message
+
+        if char == b"\x1a":  # Ctrl+Z
+            raise EOFError()
+
+        # Regular printable character insert at cursor.
+        char_str = char.decode("utf-8", errors="ignore")
+        if char_str and char_str.isprintable():
+            current_chars.insert(cursor_pos, char_str)
+            cursor_pos += 1
+            redraw_current_line("".join(current_chars), cursor_pos)
 
 
 def chat_command(args):
@@ -345,13 +518,66 @@ def chat_command(args):
         api_key = load_api_key()
         client = KindroidAPIClient(api_key, args.base_url)
         chat_id = load_chat_id(args.chat_id)
+        kindroid_name = load_kindroid_name(args.kindroid)
 
-        print("Starting chat (press Ctrl-C to exit)...\n")
+        # Fetch recent messages from last 24 hours
+        print(f"Loading chat history...\n", file=sys.stderr)
 
+        try:
+            # Calculate offset for 24 hours ago (in milliseconds for API)
+            now = datetime.now()
+            twenty_four_hours_ago = now - timedelta(hours=24)
+            offset_timestamp = int(twenty_four_hours_ago.timestamp() * 1000)
+
+            # Create a mock args object for _get_messages_impl
+            # Set high limit to ensure pagination captures all messages from last 24 hours
+            history_args = argparse.Namespace(
+                chat_id=args.chat_id,
+                limit=9999,  # Fetch many messages to get full 24-hour history
+                offset=offset_timestamp,  # Start from 24 hours ago
+                base_url=args.base_url
+            )
+
+            all_recent_messages = list(_get_messages_impl(history_args))
+
+            # Filter messages from last 24 hours (redundant but safe)
+            recent_messages = []
+            for msg in all_recent_messages:
+                if "timestamp" in msg and isinstance(msg["timestamp"], (int, float)):
+                    msg_time = datetime.fromtimestamp(msg["timestamp"] / 1000)
+                    if msg_time >= twenty_four_hours_ago:
+                        recent_messages.append(msg)
+
+            # Display last 4 messages
+            last_four = recent_messages[-4:] if recent_messages else []
+
+            if last_four:
+                print("\n--- Last messages ---\n")
+                for msg in last_four:
+                    sender = msg.get("sender", "unknown")
+                    timestamp = msg.get("timestamp")
+                    message_text = msg.get("message", "")
+
+                    if timestamp and isinstance(timestamp, (int, float)):
+                        time_str = format_unix_timestamp(timestamp, "%Y-%m-%d %H:%M")
+                        if sender == "ai":
+                            print(f"------------------\n[{time_str}] {kindroid_name}:")
+                        else:
+                            print(f"------------------\n[{time_str}]")
+                        print(f"{message_text}\n")
+
+        except Exception as e:
+            print(f"Warning: Could not load chat history: {e}", file=sys.stderr)
+
+        print(f"\n--- New messages ---\n")
+
+        # Interactive loop
         while True:
             try:
-                # Prompt user for message
-                message = input("You: ").strip()
+                time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+                # Prompt user for message (supports multi-line on Windows)
+                message = multiline_input("", f"\n------------------\n[{time_str}]: ").strip()
+                print(f"\n------------------")
                 if not message:
                     continue
 
@@ -362,14 +588,16 @@ def chat_command(args):
                         message=message,
                     )
 
+                    time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    print(f"[{time_str}] {kindroid_name}:")
+
                     # Display the response
                     if "raw_response" in response:
                         # Unescape JSON escaped characters but keep the quotes
-                        text = response["raw_response"]
-                        text = text.replace('\\"', '"').replace('\\n', '\n')
-                        print(f"Kindroid: {text}\n")
+                        text = response["raw_response"].replace('\\"', '"').replace('\\n', '\n')
+                        print(f"{text}\n")
                     else:
-                        print(f"Kindroid: {format_response(response, args.pretty)}\n")
+                        print(f"{format_response(response, args.pretty)}\n")
 
                 except requests.exceptions.RequestException as e:
                     print(f"Error sending message: {e}\n", file=sys.stderr)
@@ -480,6 +708,10 @@ Environment Variables:
         "--chat-id",
         help="The ID of the chat to use (can also use CHAT_ID env var)",
     )
+    chat_parser.add_argument(
+        "--kindroid",
+        help="The name of the Kindroid (can also use KINDROID_NAME env var)",
+    )
     chat_parser.set_defaults(func=chat_command)
 
     args = parser.parse_args()
@@ -493,4 +725,3 @@ Environment Variables:
 
 if __name__ == "__main__":
     sys.exit(main())
-
