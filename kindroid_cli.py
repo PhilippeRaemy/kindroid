@@ -101,7 +101,7 @@ class KindroidAPIClient:
         if limit is not None:
             params["limit"] = limit
         if offset is not None:
-            params["offset"] = offset
+            params["start_after_timestamp"] = offset
 
         response = self.session.get(url, params=params)
         response.raise_for_status()
@@ -228,6 +228,67 @@ def send_message_command(args):
 def get_messages_command(args):
     """Handle the get-messages command."""
     try:
+        # Check if we need to read from an existing output file
+        offset_override = args.offset
+        if args.output_file and os.path.exists(args.output_file):
+            try:
+                latest_timestamp = None
+                with open(args.output_file, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            message = json.loads(line)
+                            # Use the timestamp field (converted or original)
+                            if "timestamp" in message:
+                                latest_timestamp = message["timestamp"]
+
+                if latest_timestamp:
+                    # Convert ISO string back to milliseconds if needed for API
+                    # For now, we'll pass it directly as the API expects it
+                    offset_override = latest_timestamp
+                    print(f"Resuming from timestamp: {latest_timestamp}", file=sys.stderr)
+            except (IOError, json.JSONDecodeError) as e:
+                print(f"Error reading output file: {e}", file=sys.stderr)
+                return 1
+
+        # Temporarily override offset for the generator
+        original_offset = args.offset
+        args.offset = offset_override
+
+        # Collect all messages from the generator
+        messages = list(get_messages_command_impl(args))
+
+        # Restore original args for consistency
+        args.offset = original_offset
+
+        # Output messages
+        if args.output_file:
+            # Append to file
+            try:
+                with open(args.output_file, 'a') as f:
+                    for message in messages:
+                        f.write(json.dumps(message) + '\n')
+                print(f"Wrote {len(messages)} messages to {args.output_file}", file=sys.stderr)
+            except IOError as e:
+                print(f"Error writing to output file: {e}", file=sys.stderr)
+                return 1
+        else:
+            # Print to console
+            for message in messages:
+                print(json.dumps(message))
+
+        return 0
+
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except requests.exceptions.RequestException as e:
+        print(f"API Error: {e}", file=sys.stderr)
+        return 1
+
+def get_messages_command_impl(args):
+    """Handle the get-messages command."""
+    try:
         api_key = load_api_key()
         client = KindroidAPIClient(api_key, args.base_url)
         chat_id = load_chat_id(args.chat_id)
@@ -237,7 +298,6 @@ def get_messages_command(args):
         api_limit = min(requested_limit, 100)  # API max is 100
         needs_pagination = requested_limit > 100
 
-        all_messages = []
         start_after_timestamp = args.offset if args.offset else None
         messages_fetched = 0
 
@@ -253,7 +313,13 @@ def get_messages_command(args):
             if not messages:
                 break
 
-            all_messages.extend(messages)
+            for m in messages:
+                if requested_limit and messages_fetched >= requested_limit:
+                    break
+                if "timestamp" in m and isinstance(m["timestamp"], (int, float)):
+                    m["datetime"] = unix_timestamp_to_iso(m["timestamp"])
+                yield m
+
             messages_fetched += len(messages)
 
             # Check if we have more pages
@@ -264,19 +330,6 @@ def get_messages_command(args):
             # Set cursor for next page
             start_after_timestamp = pagination.get("lastTimestamp")
 
-        # Limit results to requested amount
-        all_messages = all_messages[:requested_limit]
-
-        # Output as JSONL with converted timestamps
-        for message in all_messages:
-            # Convert timestamp if present
-            if "timestamp" in message and isinstance(message["timestamp"], (int, float)):
-                message["timestamp"] = unix_timestamp_to_iso(message["timestamp"])
-
-            # Output as JSONL (one JSON object per line)
-            print(json.dumps(message))
-
-        return 0
 
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -411,6 +464,10 @@ Environment Variables:
         "--offset",
         type=int,
         help="Offset for pagination",
+    )
+    get_parser.add_argument(
+        "--output-file",
+        help="File to write messages to (JSONL format). If file exists, continues from latest message.",
     )
     get_parser.set_defaults(func=get_messages_command)
 
