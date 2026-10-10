@@ -12,7 +12,6 @@ Documentation: https://docs.kindroid.ai/
 import argparse
 import json
 import os
-import shutil
 import sys
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
@@ -23,10 +22,6 @@ import requests
 if sys.platform == "win32":
     import ctypes
     import msvcrt
-
-# Session-local input history used by chat prompt navigation.
-_INPUT_HISTORY = []
-_MAX_INPUT_HISTORY = 200
 
 
 class KindroidAPIClient:
@@ -381,7 +376,7 @@ def _get_messages_impl(args):
         print(f"API Error: {e}", file=sys.stderr)
 
 
-def multiline_input(line_prompt: str = "", prompt: str = "") -> str:
+def multiline_input(line_prompt: str = "") -> str:
     """
     Read multi-line input from user.
 
@@ -389,7 +384,7 @@ def multiline_input(line_prompt: str = "", prompt: str = "") -> str:
     On other systems: Falls back to standard input()
 
     Args:
-        line_prompt: The prompt to display
+        line_prompt: Optional text to print once before editing starts
 
     Returns:
         The complete input (possibly multi-line) as a string
@@ -398,32 +393,53 @@ def multiline_input(line_prompt: str = "", prompt: str = "") -> str:
         # On non-Windows systems, use standard input
         return input(line_prompt)
 
-    def redraw_current_line(line: str, cursor: int) -> None:
-        # Basic in-place redraw for the active line (single-line editor behavior).
-        terminal_width = max(20, shutil.get_terminal_size((80, 24)).columns)
-        clear_width = max(terminal_width - 1, len(line_prompt) + len(line) + 2)
-        print("\r" + (" " * clear_width) + "\r" + line_prompt + line, end="", flush=True)
-        move_left = len(line) - cursor
-        if move_left > 0:
-            print("\b" * move_left, end="", flush=True)
+    # Enable ANSI escape sequences on modern Windows terminals.
+    kernel32 = ctypes.windll.kernel32
+    stdout_handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+    mode = ctypes.c_uint()
+    if kernel32.GetConsoleMode(stdout_handle, ctypes.byref(mode)):
+        kernel32.SetConsoleMode(stdout_handle, mode.value | 0x0004)
 
     def shift_pressed() -> bool:
         # VK_SHIFT = 0x10
         return bool(ctypes.windll.user32.GetAsyncKeyState(0x10) & 0x8000)
 
-    lines = []
-    current_chars = []
-    cursor_pos = 0
-    history_index = None
-    draft_line = ""
-    print(prompt)
-    print(line_prompt, end="", flush=True)
+    lines = [""]
+    row = 0
+    col = 0
+    last_rendered_line_count = 1
+    rendered_cursor_row = 0
+    if line_prompt:
+        print(line_prompt)
 
-    def set_current_line(text: str) -> None:
-        nonlocal current_chars, cursor_pos
-        current_chars = list(text)
-        cursor_pos = len(current_chars)
-        redraw_current_line("".join(current_chars), cursor_pos)
+    def render() -> None:
+        nonlocal last_rendered_line_count, rendered_cursor_row
+        # Move from the *currently rendered* cursor row back to the top of the editable block.
+        if rendered_cursor_row > 0:
+            print(f"\x1b[{rendered_cursor_row}A", end="")
+
+        total = max(last_rendered_line_count, len(lines))
+        for i in range(total):
+            print("\r\x1b[2K", end="")
+            if i < len(lines):
+                print(lines[i], end="")
+            if i < total - 1:
+                print("\n", end="")
+
+        # Reposition cursor to logical (row, col)
+        bottom_index = total - 1
+        up = bottom_index - row
+        if up > 0:
+            print(f"\x1b[{up}A", end="")
+        line_text = lines[row]
+        target_col = col
+        print("\r" + line_text, end="")
+        move_left = len(line_text) - target_col
+        if move_left > 0:
+            print("\b" * move_left, end="")
+        print("", end="", flush=True)
+        last_rendered_line_count = len(lines)
+        rendered_cursor_row = row
 
     while True:
         char = msvcrt.getch()
@@ -434,72 +450,77 @@ def multiline_input(line_prompt: str = "", prompt: str = "") -> str:
         if char in (b"\x00", b"\xe0"):
             ext = msvcrt.getch()
             # Left / Right / Up / Down / Home / End / Delete
-            if ext == b"K" and cursor_pos > 0:
-                cursor_pos -= 1
-                redraw_current_line("".join(current_chars), cursor_pos)
-            elif ext == b"M" and cursor_pos < len(current_chars):
-                cursor_pos += 1
-                redraw_current_line("".join(current_chars), cursor_pos)
-            elif ext == b"H":  # Up: previous input history (single-line only)
-                if lines:
-                    continue
-                if not _INPUT_HISTORY:
-                    continue
-                if history_index is None:
-                    draft_line = "".join(current_chars)
-                    history_index = len(_INPUT_HISTORY) - 1
-                elif history_index > 0:
-                    history_index -= 1
-                set_current_line(_INPUT_HISTORY[history_index])
-            elif ext == b"P":  # Down: next input history / restore draft
-                if lines:
-                    continue
-                if history_index is None:
-                    continue
-                if history_index < len(_INPUT_HISTORY) - 1:
-                    history_index += 1
-                    set_current_line(_INPUT_HISTORY[history_index])
-                else:
-                    history_index = None
-                    set_current_line(draft_line)
-            elif ext == b"G":
-                cursor_pos = 0
-                redraw_current_line("".join(current_chars), cursor_pos)
-            elif ext == b"O":
-                cursor_pos = len(current_chars)
-                redraw_current_line("".join(current_chars), cursor_pos)
-            elif ext == b"S" and cursor_pos < len(current_chars):
-                del current_chars[cursor_pos]
-                redraw_current_line("".join(current_chars), cursor_pos)
+            if ext == b"K":  # Left
+                if col > 0:
+                    col -= 1
+                elif row > 0:
+                    row -= 1
+                    col = len(lines[row])
+                render()
+            elif ext == b"M":  # Right
+                if col < len(lines[row]):
+                    col += 1
+                elif row < len(lines) - 1:
+                    row += 1
+                    col = 0
+                render()
+            elif ext == b"H":  # Up
+                if row > 0:
+                    row -= 1
+                    col = min(col, len(lines[row]))
+                    render()
+            elif ext == b"P":  # Down
+                if row < len(lines) - 1:
+                    row += 1
+                    col = min(col, len(lines[row]))
+                    render()
+            elif ext == b"G":  # Home
+                col = 0
+                render()
+            elif ext == b"O":  # End
+                col = len(lines[row])
+                render()
+            elif ext == b"S":  # Delete
+                if col < len(lines[row]):
+                    line = lines[row]
+                    lines[row] = line[:col] + line[col + 1 :]
+                    render()
+                elif row < len(lines) - 1:
+                    lines[row] += lines[row + 1]
+                    del lines[row + 1]
+                    render()
             continue
 
         if char == b"\x08":  # Backspace
-            if cursor_pos > 0:
-                del current_chars[cursor_pos - 1]
-                cursor_pos -= 1
-                redraw_current_line("".join(current_chars), cursor_pos)
+            if col > 0:
+                line = lines[row]
+                lines[row] = line[: col - 1] + line[col:]
+                col -= 1
+                render()
+            elif row > 0:
+                prev_len = len(lines[row - 1])
+                lines[row - 1] += lines[row]
+                del lines[row]
+                row -= 1
+                col = prev_len
+                render()
             continue
 
         if char == b"\r":  # Enter
-            current_line = "".join(current_chars)
             if shift_pressed():
-                # Shift+Enter inserts newline and keeps editing next line.
-                lines.append(current_line)
-                current_chars = []
-                cursor_pos = 0
-                print()
-                print(line_prompt, end="", flush=True)
+                # Shift+Enter inserts newline at cursor.
+                line = lines[row]
+                before = line[:col]
+                after = line[col:]
+                lines[row] = before
+                lines.insert(row + 1, after)
+                row += 1
+                col = 0
+                render()
                 continue
 
-            lines.append(current_line)
             print()
-            message = "\n".join(lines)
-            # Keep prompt history practical for line recall (single-line messages only).
-            if message and "\n" not in message:
-                _INPUT_HISTORY.append(message)
-                if len(_INPUT_HISTORY) > _MAX_INPUT_HISTORY:
-                    del _INPUT_HISTORY[0]
-            return message
+            return "\n".join(lines)
 
         if char == b"\x1a":  # Ctrl+Z
             raise EOFError()
@@ -507,9 +528,10 @@ def multiline_input(line_prompt: str = "", prompt: str = "") -> str:
         # Regular printable character insert at cursor.
         char_str = char.decode("utf-8", errors="ignore")
         if char_str and char_str.isprintable():
-            current_chars.insert(cursor_pos, char_str)
-            cursor_pos += 1
-            redraw_current_line("".join(current_chars), cursor_pos)
+            line = lines[row]
+            lines[row] = line[:col] + char_str + line[col:]
+            col += 1
+            render()
 
 
 def chat_command(args):
@@ -576,7 +598,8 @@ def chat_command(args):
             try:
                 time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
                 # Prompt user for message (supports multi-line on Windows)
-                message = multiline_input("", f"\n------------------\n[{time_str}]: ").strip()
+                print(f"\n------------------\n[{time_str}] {kindroid_name}:")
+                message = multiline_input().strip()
                 print(f"\n------------------")
                 if not message:
                     continue
